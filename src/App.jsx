@@ -18,12 +18,11 @@ const BOX_DIMENSIONS = { A:"12x12x12", B:"9x16x22", C:"11x16x22", D:"13x16x24" }
 const COL = {
   pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION",
   color:"COLOR NAME",
-  custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #",
-  // NOTE: "Line 1" must equal the line number in CSV export (1-based). We'll compute it from the first contributing CSV row index.
+  custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #", lineNo:"SALES ORDER LINE #",
   size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY"
 };
 
-// Prefer Box D globally to minimize box count
+// Prefer Box D globally
 const PREFER_BOX_D = true;
 
 // --- Normalizers ---
@@ -54,23 +53,21 @@ function getCapacity(mode,sleeve,band){ return (mode==="POLYBAG"?CAP_POLYBAG:CAP
 function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
 
-// Prefer D algorithm: greedily fill D box caps per band, then open a new D
 function splitByCapacityPreferD(sizes, capsSXL, capsBIG){
   const rem = {...sizes}; const boxes=[];
   while(sumSizes(rem)>0){
-    const capSXL=capsSXL.D, capBIG=capsBIG.D;
+    const boxType = "D"; // always D
+    const capSXL=capsSXL[boxType], capBIG=capsBIG[boxType];
     const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
     const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
       const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
-    ["S","M","L","XL"].forEach(k=>push(k,"SXL"));
-    ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
+    ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
     if(sumSizes(out)===0){ break; }
-    boxes.push({boxType:"D", sizes: out});
+    boxes.push({boxType, sizes: out});
   }
   return {boxes};
 }
 
-// Fallback "smallest that fits" (not used by default, but kept as option)
 function splitByCapacitySmallest(sizes, capsSXL, capsBIG){
   const rem = {...sizes}; const boxes=[];
   while(sumSizes(rem)>0){
@@ -84,8 +81,7 @@ function splitByCapacitySmallest(sizes, capsSXL, capsBIG){
     const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
     const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
       const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
-    ["S","M","L","XL"].forEach(k=>push(k,"SXL"));
-    ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
+    ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
     if(sumSizes(out)===0){ break; }
     boxes.push({boxType, sizes: out});
   }
@@ -113,7 +109,7 @@ function zplForLabel(meta, box){
   z+=`^FO${left},${y}^A0N,24,18^FDBOX ${box.boxIndex} OF ${box.boxCount}^FS\n`; y+=28;
   const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "";
   z+=`^FO${left},${y}^A0N,24,18^FDBox Size: ${box.boxType}${dim}^FS\n`; y+=28;
-  z+=`^FO${left},${y}^A0N,24,18^FDLine ${meta.lineSeq}^FS\n`; y+=32;
+  z+=`^FO${left},${y}^A0N,24,18^FDLine 1^FS\n`; y+=32;
   z+=`^FO${left},${LL-180}^BY2,2,120^BCN,120,Y,N,N^FD${escapeZPL(meta.pick)}^FS\n`;
   z+="^XZ\n"; return z;
 }
@@ -129,14 +125,14 @@ function renderPDF(labels){
     ["S","M","L","XL","2X","3X","4X","5X"].forEach(sk=>sizeLine(sk, box.sizes[sk]||0));
     y+=4; line(`Total: ${box.total}`,12,true); y+=6; doc.setFontSize(11); doc.setFont("helvetica","bold"); doc.text(`BOX ${box.boxIndex} OF ${box.boxCount}`,x0,y); y+=16;
     const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : ""; doc.setFont("helvetica","normal"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
-    doc.text(`Line ${meta.lineSeq}`, x0, y); y+=14; const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
+    doc.text(`Line 1`, x0, y); y+=14; const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
   };
   labels.forEach((l,i)=>draw(l,i===0)); return doc;
 }
 
 function Barcode({value}){
   const id = useMemo(()=>`bc_${Math.random().toString(36).slice(2)}`,[]);
-  React.useEffect(()=>{ const c=document.getElementById(id); if(c){ try{ JsBarcode(c, value||"000000", {format:"CODE128", displayValue:false, margin:0, height:40, width:1.6}); }catch{} } },[id,value]);
+  React.useEffect(()=>{ const c=document.getElementById(id); if(c){ try{ JsBarcode(c, value||"000000", {format:"CODE128", displayValue:false, margin:0, height:40, width:1.6}); }catch{}} },[id,value]);
   return <canvas id={id} style={{width:240, height:50}} />;
 }
 
@@ -151,10 +147,9 @@ export default function App(){
   const onFiles = (files) => {
     if(!files || files.length===0) return;
     const loaded=[];
-    Array.from(files).forEach((f)=>{
-      loaded.push(new Promise((resolve)=>{
-        Papa.parse(f,{header:true, skipEmptyLines:true, complete:(res)=>resolve(res.data.map((row,i)=>({...row, __csvLine:i+2}))) });
-        // __csvLine is the 1-based row number in the CSV including header row at line 1, so data starts at line 2
+    Array.from(files).forEach(f=>{
+      loaded.push(new Promise(resolve=>{
+        Papa.parse(f,{header:true, skipEmptyLines:true, complete:(res)=>resolve(res.data)});
       }));
     });
     Promise.all(loaded).then(all=>{ setRows([].concat(...all)); });
@@ -166,43 +161,37 @@ export default function App(){
     const errs=[]; const groups=new Map();
     const grab=(r,k)=>normString(r?.[k]);
     rows.forEach((r, idx)=>{
-      const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder);
+      const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder), line=grab(r,COL.lineNo);
       const body=grab(r,COL.bodyDesc), color=grab(r,COL.color), po=normPO(r?.[COL.custPO]), spec1=grab(r,COL.specInst1);
       const rawSize=grab(r,COL.size); const size=normalizeSizeToken(rawSize);
       const qty=Number(grab(r,COL.sizeQty)||0);
       const lineQtyMaybe = Number(grab(r,COL.lineQtyMaybe) || 0) || null;
-      const lineSeq = Number(r.__csvLine || (idx+2)); // visual "Line" on label
 
       const mode=detectMode(spec1), sleeve=detectSleeve(body);
       if(!pick||!item||!wo){ errs.push(`Row ${idx+1}: missing key fields (Pick/Item/WO)`); return; }
 
-      const gk={pick,item,wo,body,color,po}; const key=JSON.stringify(gk);
-      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, _rawIgnored:[], expected: lineQtyMaybe, lineSeqs:[lineSeq]});
+      const gk={pick,item,wo,line,body,color,po}; const key=JSON.stringify(gk);
+      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po, _rawIgnored:[], expected: lineQtyMaybe});
       const g=groups.get(key);
       if(size){ g.sizes[size]+=qty; } else if(rawSize){ g._rawIgnored.push(rawSize); }
       if(lineQtyMaybe){ g.expected = lineQtyMaybe; }
-      g.lineSeqs.push(lineSeq);
     });
 
     const out=[];
     let blocking=false;
 
     groups.forEach((g)=>{
-      const {key:baseMeta, sizes, mode, sleeve, _rawIgnored, expected, lineSeqs} = g;
+      const {key:meta, sizes, mode, sleeve, _rawIgnored, expected} = g;
       const actual = sumSizes(sizes);
       if(expected!==null && expected!==undefined && expected!==0 && expected!==actual){
         blocking=true;
-        errs.push(`Pick ${baseMeta.pick} / Item ${baseMeta.item} / WO ${baseMeta.wo}: sizes sum ${actual} ≠ line qty ${expected}. Ignored sizes: [${_rawIgnored.join(", ")}]`);
+        errs.push(`Pick ${meta.pick} / Item ${meta.item} / WO ${meta.wo} / Line ${meta.line}: sizes sum ${actual} ≠ line qty ${expected}. Ignored raw sizes: [${_rawIgnored.join(", ")}]`);
       }
 
       const sxl=getCapacity(mode,sleeve,"SXL"); const big=getCapacity(mode,sleeve,"BIG");
-      const splitter = preferD ? splitByCapacityPreferD : splitByCapacitySmallest;
-      const {boxes} = splitter(sizes, sxl, big);
-      const lineSeq = Math.min(...lineSeqs.filter(Boolean)); // first contributing CSV line number
-
+      const {boxes} = (preferD? splitByCapacityPreferD : splitByCapacitySmallest)(sizes, sxl, big);
       boxes.forEach((b,i)=>{
         const total = SIZE_ORDER.reduce((a,k)=>a+(b.sizes[k]||0),0);
-        const meta = {...baseMeta, lineSeq};
         out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
       });
     });
@@ -215,23 +204,22 @@ export default function App(){
   const downloadLogs = ()=>{
     const ts=new Date().toISOString(); const rowsOut=[];
     labels.forEach(({meta,box})=>{
-      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, line_in_csv:meta.lineSeq, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
+      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, line:meta.line, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
     });
     csvDownload(`label_log_${ts.replace(/[:]/g,'-')}.csv`, rowsOut);
   };
 
   const runTests = ()=>{
     const logs=[]; const ok=(n,c)=>logs.push(`${c?"✓":"✗"} ${n}`);
-    // Prefer D test
+    // Prefer D: if we have only S sizes, first box must be D.
     const sizesPF = normalizeSizes({S:10});
-    const sxl = CAP_PRINTERS_FOLD.SS.SXL, big = CAP_PRINTERS_FOLD.SS.BIG;
-    const bPF = splitByCapacityPreferD(sizesPF, sxl, big).boxes;
+    const bPF = splitByCapacityPreferD(sizesPF, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
     ok("prefer D boxes", bPF[0].boxType==="D");
-    // Caps respected: D caps
-    const bigOnly = normalizeSizes({"2X":100});
-    const b2 = splitByCapacityPreferD(bigOnly, sxl, big).boxes;
+    // Caps must be respected
+    const big = normalizeSizes({"2X":100});
+    const b2 = splitByCapacityPreferD(big, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
     const firstBIG = b2[0].sizes["2X"]+b2[0].sizes["3X"]+b2[0].sizes["4X"]+b2[0].sizes["5X"];
-    ok("big band cap respected (D max)", firstBIG <= big.D);
+    ok("big band cap respected (D max)", firstBIG <= CAP_PRINTERS_FOLD.SS.BIG.D);
     setTests(logs);
   };
 
@@ -240,7 +228,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p><span className="pill">Prefers Box D</span> for fewer cartons; shows <b>Line &lt;CSV row&gt;</b> on each label.</p>
+      <p><span className="pill">Prefers Box D</span> while enforcing S‑XL and 2X‑5X band caps per your table.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
@@ -285,14 +273,14 @@ export default function App(){
                 <div><b>Customer PO#:</b> {l.meta.po}</div>
                 <div><b>Work Order:</b> {l.meta.wo}</div>
                 <div className="grid-1">
-                  {SIZE_ORDER.map((sk)=>(
+                  {SIZE_ORDER.map(sk=>(
                     <div key={sk} style={{display:'flex', justifyContent:'space-between'}}><b>{sk}:</b><span>{l.box.sizes[sk]||""}</span></div>
                   ))}
                 </div>
                 <div style={{marginTop:8}}><b>Total:</b> {l.box.total}</div>
                 <div>BOX {l.box.boxIndex} OF {l.box.boxCount}</div>
                 <div>Box Size: {l.box.boxType} {BOX_DIMENSIONS[l.box.boxType]||""}</div>
-                <div>Line {l.meta.lineSeq}</div>
+                <div>Line 1</div>
                 <Barcode value={l.meta.pick} />
               </div>
             ))}
@@ -305,7 +293,7 @@ export default function App(){
           <table>
             <thead>
               <tr>
-                <th>Pick</th><th>Item</th><th>WO</th><th>CSV Line</th><th>Box</th><th>Type</th>
+                <th>Pick</th><th>Item</th><th>WO</th><th>Line</th><th>Box</th><th>Type</th>
                 <th>S</th><th>M</th><th>L</th><th>XL</th><th>2X</th><th>3X</th><th>4X</th><th>5X</th><th>Total</th>
               </tr>
             </thead>
@@ -315,7 +303,7 @@ export default function App(){
                   <td>{l.meta.pick}</td>
                   <td>{l.meta.item}</td>
                   <td>{l.meta.wo}</td>
-                  <td>{l.meta.lineSeq}</td>
+                  <td>{l.meta.line}</td>
                   <td>{l.box.boxIndex} / {l.box.boxCount}</td>
                   <td>{l.box.boxType}</td>
                   <td>{l.box.sizes.S||""}</td>
@@ -342,4 +330,3 @@ export default function App(){
       )}
     </div>
   );
-}
