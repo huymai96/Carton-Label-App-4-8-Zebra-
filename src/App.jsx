@@ -6,102 +6,114 @@ import JsBarcode from "jsbarcode";
 import { jsPDF } from "jspdf";
 
 const SIZE_ORDER = ["S","M","L","XL","2X","3X","4X","5X"];
-const CAP_PRINTERS_FOLD = {
+const BOXES = ["A","B","C","D"];
+
+// CAP TABLES from user
+const PF = {
   SS: { SXL:{A:24,B:48,C:60,D:72}, BIG:{A:18,B:36,C:42,D:48} },
   LS: { SXL:{A:18,B:36,C:48,D:60}, BIG:{A:12,B:24,C:36,D:48} },
 };
-const CAP_POLYBAG = {
-  SS: { SXL:{A:18,B:36,C:48,D:60}, BIG:{A:16,B:30,C:36,D:40} },
+const PB = {
+  SS: { SXL:{A:18,B:36,C:48,D:60}, BIG:{A:16,B:30,C:36,D:48} },
   LS: { SXL:{A:16,B:30,C:36,D:48}, BIG:{A:12,B:24,C:30,D:40} },
 };
+function totalCap(mode, sleeve){ const T = mode==="POLYBAG"?PB:PF; return T[sleeve].SXL; } // total cap is SXL cap
+
 const BOX_DIMENSIONS = { A:"12x12x12", B:"9x16x22", C:"11x16x22", D:"13x16x24" };
 const COL = {
   pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION",
-  color:"COLOR NAME", // <-- switched to Column Q (Color Name)
-  custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #", lineNo:"SALES ORDER LINE #",
+  color:"COLOR NAME",
+  custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #",
   size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY"
 };
-const DEFAULT_SELECT_SMALLEST_FIT = true;
 
-// --- Normalizers ---
-function normString(s){ return (s??"").toString().normalize("NFKC").replace(/\u2019/g,"'").trim(); }
-function normPO(s){ return normString(s).replace(/^['"]+/, ""); }
+function normString(s){ return (s??"").toString().normalize("NFKC").replace(/\\u2019/g,\"'\").trim(); }
+function normPO(s){ return normString(s).replace(/^['\"]+/, \"\"); }
 
 const SIZE_ALIAS = new Map(Object.entries({
-  "XS":"", "X-SMALL":"", "X SMALL":"", // ignored sizes
-  "S":"S", "SM":"S", "SMALL":"S",
-  "M":"M", "MEDIUM":"M",
-  "L":"L", "LG":"L", "LARGE":"L",
-  "XL":"XL", "X-LARGE":"XL", "X LARGE":"XL",
-  "2X":"2X", "XXL":"2X", "2XL":"2X", "XX-LARGE":"2X", "2 X LARGE":"2X",
-  "3X":"3X", "3XL":"3X", "XXX-LARGE":"3X",
-  "4X":"4X", "4XL":"4X",
-  "5X":"5X", "5XL":"5X",
-  "6X":"", "6XL":"", // ignore per rule
+  \"XS\":\"\", \"X-SMALL\":\"\", \"X SMALL\":\"\",
+  \"S\":\"S\", \"SM\":\"S\", \"SMALL\":\"S\",
+  \"M\":\"M\", \"MEDIUM\":\"M\",
+  \"L\":\"L\", \"LG\":\"L\", \"LARGE\":\"L\",
+  \"XL\":\"XL\", \"X-LARGE\":\"XL\", \"X LARGE\":\"XL\",
+  \"2X\":\"2X\", \"XXL\":\"2X\", \"2XL\":\"2X\", \"XX-LARGE\":\"2X\", \"2 X LARGE\":\"2X\",
+  \"3X\":\"3X\", \"3XL\":\"3X\", \"XXX-LARGE\":\"3X\",
+  \"4X\":\"4X\", \"4XL\":\"4X\",
+  \"5X\":\"5X\", \"5XL\":\"5X\",
+  \"6X\":\"\", \"6XL\":\"\"
 }));
+function normalizeSizeToken(tok){ const t = normString(tok).toUpperCase().replace(/\\s+/g,\"\"); return SIZE_ALIAS.get(t) ?? \"\"; }
 
-function normalizeSizeToken(tok){
-  const t = normString(tok).toUpperCase().replace(/\s+/g,"");
-  return SIZE_ALIAS.get(t) ?? "";
-}
-
-function detectMode(spec){ if(!spec) return "PRINTERS_FOLD"; return /polybag/i.test(spec)?"POLYBAG":"PRINTERS_FOLD"; }
-function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|LONG\s*SLEEVE/i.test(body)) return "LS"; return "SS"; }
-function getCapacity(mode,sleeve,band){ return (mode==="POLYBAG"?CAP_POLYBAG:CAP_PRINTERS_FOLD)[sleeve][band]; }
-function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
+function detectMode(spec){ if(!spec) return \"PRINTERS_FOLD\"; return /polybag/i.test(spec)?\"POLYBAG\":\"PRINTERS_FOLD\"; }
+function detectSleeve(body){ if(!body) return \"SS\"; if(/\\bLS\\b|LONG\\s*SLEEVE/i.test(body)) return \"LS\"; return \"SS\"; }
+function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,\"2X\":0,\"3X\":0,\"4X\":0,\"5X\":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
-function pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG){
-  // choose the smallest box that can take at least 1 piece and prioritizes fitting as much as possible band‑wise
-  const order=["A","B","C","D"];
-  for(const b of order){
-    const can = Math.min(remSXL, capsSXL[b]) + Math.min(remBIG, capsBIG[b]);
-    if (can > 0) return b;
-  }
-  return "D";
+
+function fillBox(rem, capSXL, capBIG, totals, boxType){
+  const out=normalizeSizes({}); let usedSXL=0, usedBIG=0, usedTOT=0;
+  const tryPush=(key,band)=>{
+    const capBand = band===\"SXL\"?capSXL[boxType]:capBIG[boxType];
+    const leftBand = capBand - (band===\"SXL\"?usedSXL:usedBIG);
+    const leftTot  = totals[boxType] - usedTOT;
+    const canTake = Math.max(0, Math.min(rem[key], leftBand, leftTot));
+    if(canTake>0){
+      out[key]+=canTake; rem[key]-=canTake; usedTOT+=canTake;
+      if(band===\"SXL\") usedSXL+=canTake; else usedBIG+=canTake;
+    }
+  };
+  [\"S\",\"M\",\"L\",\"XL\"].forEach(k=>tryPush(k,\"SXL\"));
+  [\"2X\",\"3X\",\"4X\",\"5X\"].forEach(k=>tryPush(k,\"BIG\"));
+  return out;
 }
 
-function splitByCapacityInOrder(sizes, capsSXL, capsBIG){
+function qualifiesFullD(rem, capSXL, capBIG, totals){
+  const remSXL = rem.S+rem.M+rem.L+rem.XL;
+  const remBIG = rem[\"2X\"]+rem[\"3X\"]+rem[\"4X\"]+rem[\"5X\"];
+  const remTOT = remSXL + remBIG;
+  return remSXL>=capSXL.D || remBIG>=capBIG.D || remTOT>=totals.D;
+}
+
+function smallestThatFits(rem, capSXL, capBIG, totals){
+  const remSXL = rem.S+rem.M+rem.L+rem.XL;
+  const remBIG = rem[\"2X\"]+rem[\"3X\"]+rem[\"4X\"]+rem[\"5X\"];
+  const remTOT = remSXL + remBIG;
+  for(const b of BOXES){
+    if(remSXL<=capSXL[b] && remBIG<=capBIG[b] && remTOT<=totals[b]) return b;
+  }
+  return \"D\";
+}
+
+function splitHybridStrict(sizes, capsSXL, capsBIG, totals){
   const rem = {...sizes}; const boxes=[];
+  while(qualifiesFullD(rem, capsSXL, capsBIG, totals)){
+    const pack = fillBox(rem, capsSXL, capsBIG, totals, \"D\");
+    if(sumSizes(pack)===0) break;
+    boxes.push({boxType:\"D\", sizes:pack});
+  }
   while(sumSizes(rem)>0){
-    const remSXL = rem.S + rem.M + rem.L + rem.XL;
-    const remBIG = rem["2X"] + rem["3X"] + rem["4X"] + rem["5X"];
-    const boxType = pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG);
-    const capSXL=capsSXL[boxType], capBIG=capsBIG[boxType];
-    const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
-    const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
-      const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
-    ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
-    if(sumSizes(out)===0){ const k=SIZE_ORDER.find(k=>rem[k]>0); out[k]=1; rem[k]-=1; }
-    // assert per‑band caps are never exceeded
-    const sxlPacked = out.S+out.M+out.L+out.XL;
-    const bigPacked = out["2X"]+out["3X"]+out["4X"]+out["5X"];
-    if (sxlPacked > capSXL || bigPacked > capBIG){
-      // clamp if any logic drift
-      const clamp = (keys, cap, used)=>{
-        let total = keys.reduce((a,k)=>a+out[k],0);
-        while(total>cap){
-          for(const k of keys){
-            if(out[k]>0){ out[k]--; rem[k]++; total--; used--; break; }
-          }
-        }
-        return used;
-      };
-      usedSXL = clamp(["S","M","L","XL"], capSXL, usedSXL);
-      usedBIG = clamp(["2X","3X","4X","5X"], capBIG, usedBIG);
+    const chosen = smallestThatFits(rem, capsSXL, capsBIG, totals);
+    const pack = fillBox(rem, capsSXL, capsBIG, totals, chosen);
+    if(sumSizes(pack)===0){ // safety: move 1 smallest size
+      const k = SIZE_ORDER.find(k=>rem[k]>0); if(!k) break;
+      const band = [\"S\",\"M\",\"L\",\"XL\"].includes(k)?\"SXL\":\"BIG\";
+      const leftBand = (band===\"SXL\"?capsSXL[chosen]:capBIG[chosen])[chosen];
+      const leftTot  = totals[chosen];
+      if(leftBand>0 && leftTot>0){ pack[k]=1; rem[k]-=1; }
+      if(sumSizes(pack)===0) break;
     }
-    boxes.push({boxType, sizes: out});
+    boxes.push({boxType:chosen, sizes:pack});
   }
   return {boxes};
 }
 
-function canvasFromBarcode(v){ const c=document.createElement("canvas"); JsBarcode(c, v||"000000", {format:"CODE128", displayValue:false, margin:0, height:45, width:1.6}); return c; }
-function csvDownload(filename, rows){ const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"}); saveAs(blob, filename); }
-function escapeZPL(s){ return (s??"").replace(/[\\^~]/g, ch=>({"^":"\\^","~":"\\~","\\":"\\\\"}[ch])); }
+function canvasFromBarcode(v){ const c=document.createElement(\"canvas\"); JsBarcode(c, v||\"000000\", {format:\"CODE128\", displayValue:false, margin:0, height:45, width:1.6}); return c; }
+function csvDownload(filename, rows){ const csv = Papa.unparse(rows); const blob = new Blob([csv], {type:\"text/csv;charset=utf-8;\"}); saveAs(blob, filename); }
+function escapeZPL(s){ return (s??\"\").replace(/[\\^~]/g, ch=>({\"^\":\"\\\\^\",\"~\":\"\\\\~\",\"\\\\\":\"\\\\\\\\\"}[ch])); }
 function zplForLabel(meta, box){
   const PW=812, LL=1624; const left=20; let y=20; const lh=28;
-  const L=(t,b=false)=>{ const f=b?"^A0N,28,20":"^A0N,24,18"; const s=`^FO${left},${y}${f}^FD${escapeZPL(t)}^FS\n`; y+=lh; return s; };
-  const sizeLine=(label,val)=>{ const s=`^FO${left},${y}^A0N,24,18^FD${label}:^FS\n^FO${left+120},${y}^A0N,24,18^FD${val?val:""}^FS\n`; y+=26; return s; };
-  let z="^XA\n^CI28\n^PW"+PW+"\\n^LL"+LL+"\\n";
+  const L=(t,b=false)=>{ const f=b?\"^A0N,28,20\":\"^A0N,24,18\"; const s=`^FO${left},${y}${f}^FD${escapeZPL(t)}^FS\\n`; y+=lh; return s; };
+  const sizeLine=(label,val)=>{ const s=`^FO${left},${y}^A0N,24,18^FD${label}:^FS\\n^FO${left+120},${y}^A0N,24,18^FD${val?val:\"\"}^FS\\n`; y+=26; return s; };
+  let z=\"^XA\\n^CI28\\n^PW\"+PW+\"\\n^LL\"+LL+\"\\n\";
   z+=L(`Pick Ticket: ${meta.pick}`,true);
   z+=L(`Item ID: ${meta.item}`,true);
   z+=L(`Body Desc.: ${meta.body}`);
@@ -109,36 +121,36 @@ function zplForLabel(meta, box){
   z+=L(`Customer PO#: ${meta.po}`);
   z+=L(`Work Order: ${meta.wo}`);
   y+=6;
-  z+=sizeLine("S", box.sizes.S); z+=sizeLine("M", box.sizes.M); z+=sizeLine("L", box.sizes.L); z+=sizeLine("XL", box.sizes.XL);
-  z+=sizeLine("2X", box.sizes["2X"]); z+=sizeLine("3X", box.sizes["3X"]); z+=sizeLine("4X", box.sizes["4X"]); z+=sizeLine("5X", box.sizes["5X"]);
+  z+=sizeLine(\"S\", box.sizes.S); z+=sizeLine(\"M\", box.sizes.M); z+=sizeLine(\"L\", box.sizes.L); z+=sizeLine(\"XL\", box.sizes.XL);
+  z+=sizeLine(\"2X\", box.sizes[\"2X\"]); z+=sizeLine(\"3X\", box.sizes[\"3X\"]); z+=sizeLine(\"4X\", box.sizes[\"4X\"]); z+=sizeLine(\"5X\", box.sizes[\"5X\"]);
   y+=6; z+=L(`Total: ${box.total}`, true); y+=6;
-  z+=`^FO${left},${y}^A0N,24,18^FDBOX ${box.boxIndex} OF ${box.boxCount}^FS\n`; y+=28;
-  const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "";
-  z+=`^FO${left},${y}^A0N,24,18^FDBox Size: ${box.boxType}${dim}^FS\n`; y+=28;
-  z+=`^FO${left},${y}^A0N,24,18^FDLine 1^FS\n`; y+=32;
-  z+=`^FO${left},${LL-180}^BY2,2,120^BCN,120,Y,N,N^FD${escapeZPL(meta.pick)}^FS\n`;
-  z+="^XZ\n"; return z;
+  z+=`^FO${left},${y}^A0N,24,18^FDBOX ${box.boxIndex} OF ${box.boxCount}^FS\\n`; y+=28;
+  const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : \"\";
+  z+=`^FO${left},${y}^A0N,24,18^FDBox Size: ${box.boxType}${dim}^FS\\n`; y+=28;
+  z+=`^FO${left},${y}^A0N,24,18^FDLine ${meta.lineSeq}^FS\\n`; y+=32;
+  z+=`^FO${left},${LL-180}^BY2,2,120^BCN,120,Y,N,N^FD${escapeZPL(meta.pick)}^FS\\n`;
+  z+=\"^XZ\\n\"; return z;
 }
-function renderAllZPL(labels){ return labels.map(l=>zplForLabel(l.meta, l.box)).join("\\n"); }
+function renderAllZPL(labels){ return labels.map(l=>zplForLabel(l.meta, l.box)).join(\"\\n\"); }
 function renderPDF(labels){
-  const doc=new jsPDF({orientation:"portrait", unit:"pt", format:[288,576]});
+  const doc=new jsPDF({orientation:\"portrait\", unit:\"pt\", format:[288,576]});
   const draw=(l,isFirst)=>{
-    if(!isFirst) doc.addPage([288,576],"portrait"); const {meta, box} = l;
-    const x0=18; let y=16; const line=(t,fs=12,b=false)=>{ doc.setFont("helvetica", b?"bold":"normal"); doc.setFontSize(fs); doc.text(t,x0,y); y+=fs+6; };
+    if(!isFirst) doc.addPage([288,576],\"portrait\"); const {meta, box} = l;
+    const x0=18; let y=16; const line=(t,fs=12,b=false)=>{ doc.setFont(\"helvetica\", b?\"bold\":\"normal\"); doc.setFontSize(fs); doc.text(t,x0,y); y+=fs+6; };
     line(`Pick Ticket: ${meta.pick}`,14,true); line(`Item ID: ${meta.item}`,12,true);
     line(`Body Desc.: ${meta.body}`,11); line(`Color: ${meta.color}`,11); line(`Customer PO#: ${meta.po}`,11); line(`Work Order: ${meta.wo}`,11);
-    y+=4; const sizeLine=(lab,val)=>{ const lh=14; doc.setFontSize(12); doc.setFont("helvetica","bold"); doc.text(`${lab}:`,x0,y); doc.setFont("helvetica","normal"); doc.text(val?String(val):"", x0+40, y); y+=lh; };
-    ["S","M","L","XL","2X","3X","4X","5X"].forEach(sk=>sizeLine(sk, box.sizes[sk]||0));
-    y+=4; line(`Total: ${box.total}`,12,true); y+=6; doc.setFontSize(11); doc.setFont("helvetica","bold"); doc.text(`BOX ${box.boxIndex} OF ${box.boxCount}`,x0,y); y+=16;
-    const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : ""; doc.setFont("helvetica","normal"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
-    doc.text(`Line 1`, x0, y); y+=14; const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
+    y+=4; const sizeLine=(lab,val)=>{ const lh=14; doc.setFontSize(12); doc.setFont(\"helvetica\",\"bold\"); doc.text(`${lab}:`,x0,y); doc.setFont(\"helvetica\",\"normal\"); doc.text(val?String(val):\"\", x0+40, y); y+=lh; };
+    [\"S\",\"M\",\"L\",\"XL\",\"2X\",\"3X\",\"4X\",\"5X\"].forEach(sk=>sizeLine(sk, box.sizes[sk]||0));
+    y+=4; line(`Total: ${box.total}`,12,true); y+=6; doc.setFontSize(11); doc.setFont(\"helvetica\",\"bold\"); doc.text(`BOX ${box.boxIndex} OF ${box.boxCount}`,x0,y); y+=16;
+    const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : \"\"; doc.setFont(\"helvetica\",\"normal\"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
+    doc.text(`Line ${meta.lineSeq}`, x0, y); y+=14; const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL(\"image/png\"),\"PNG\", x0, 576-bcH-24, bcW, bcH);
   };
   labels.forEach((l,i)=>draw(l,i===0)); return doc;
 }
 
 function Barcode({value}){
   const id = useMemo(()=>`bc_${Math.random().toString(36).slice(2)}`,[]);
-  React.useEffect(()=>{ const c=document.getElementById(id); if(c){ try{ JsBarcode(c, value||"000000", {format:"CODE128", displayValue:false, margin:0, height:40, width:1.6}); }catch{}} },[id,value]);
+  React.useEffect(()=>{ const c=document.getElementById(id); if(c){ try{ JsBarcode(c, value||\"000000\", {format:\"CODE128\", displayValue:false, margin:0, height:40, width:1.6}); }catch{} } },[id,value]);
   return <canvas id={id} style={{width:240, height:50}} />;
 }
 
@@ -152,9 +164,9 @@ export default function App(){
   const onFiles = (files) => {
     if(!files || files.length===0) return;
     const loaded=[];
-    Array.from(files).forEach(f=>{
-      loaded.push(new Promise(resolve=>{
-        Papa.parse(f,{header:true, skipEmptyLines:true, complete:(res)=>resolve(res.data)});
+    Array.from(files).forEach((f)=>{
+      loaded.push(new Promise((resolve)=>{
+        Papa.parse(f,{header:true, skipEmptyLines:true, complete:(res)=>resolve(res.data.map((row,i)=>({...row, __csvLine:i+2, __file:f.name}))) });
       }));
     });
     Promise.all(loaded).then(all=>{ setRows([].concat(...all)); });
@@ -166,37 +178,44 @@ export default function App(){
     const errs=[]; const groups=new Map();
     const grab=(r,k)=>normString(r?.[k]);
     rows.forEach((r, idx)=>{
-      const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder), line=grab(r,COL.lineNo);
+      const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder);
       const body=grab(r,COL.bodyDesc), color=grab(r,COL.color), po=normPO(r?.[COL.custPO]), spec1=grab(r,COL.specInst1);
       const rawSize=grab(r,COL.size); const size=normalizeSizeToken(rawSize);
       const qty=Number(grab(r,COL.sizeQty)||0);
       const lineQtyMaybe = Number(grab(r,COL.lineQtyMaybe) || 0) || null;
+      const lineSeq = Number(r.__csvLine || (idx+2));
 
       const mode=detectMode(spec1), sleeve=detectSleeve(body);
       if(!pick||!item||!wo){ errs.push(`Row ${idx+1}: missing key fields (Pick/Item/WO)`); return; }
 
-      const gk={pick,item,wo,line,body,color,po}; const key=JSON.stringify(gk);
-      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po, _rawIgnored:[], expected: lineQtyMaybe});
+      const gk={pick,item,wo,body,color,po,mode,sleeve}; // mode & sleeve bound per pick/item combo
+      const key=JSON.stringify(gk);
+      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), _rawIgnored:[], expected: lineQtyMaybe, lineSeqs:[lineSeq]});
       const g=groups.get(key);
       if(size){ g.sizes[size]+=qty; } else if(rawSize){ g._rawIgnored.push(rawSize); }
       if(lineQtyMaybe){ g.expected = lineQtyMaybe; }
+      g.lineSeqs.push(lineSeq);
     });
 
-    const out=[];
-    let blocking=false;
+    const out=[]; let blocking=false;
 
     groups.forEach((g)=>{
-      const {key:meta, sizes, mode, sleeve, _rawIgnored, expected} = g;
+      const {key:baseMeta, sizes, _rawIgnored, expected, lineSeqs} = g;
+      const {mode, sleeve, ...metaFields} = baseMeta;
       const actual = sumSizes(sizes);
-      if(expected!==null && expected!==undefined && expected!==0 && expected!==actual){
-        blocking=true;
-        errs.push(`Pick ${meta.pick} / Item ${meta.item} / WO ${meta.wo} / Line ${meta.line}: sizes sum ${actual} ≠ line qty ${expected}. Ignored raw sizes: [${_rawIgnored.join(", ")}]`);
-      }
+      if(expected){ if(actual!==expected){ blocking=true; errs.push(`Pick ${metaFields.pick} / Item ${metaFields.item} / WO ${metaFields.wo}: sizes sum ${actual} ≠ line qty ${expected}. Ignored: [${_rawIgnored.join(", ")}]`);} }
 
-      const sxl=getCapacity(mode,sleeve,"SXL"); const big=getCapacity(mode,sleeve,"BIG");
-      const {boxes} = splitByCapacityInOrder(sizes, sxl, big);
+      const table = mode==="POLYBAG"?PB:PF;
+      const capsSXL = table[sleeve].SXL;
+      const capsBIG = table[sleeve].BIG;
+      const totals  = table[sleeve].SXL; // per rule
+
+      const {boxes} = splitHybridStrict(sizes, capsSXL, capsBIG, totals);
+      const lineSeq = Math.min(...lineSeqs.filter(Boolean));
+
       boxes.forEach((b,i)=>{
-        const total = sumSizes(b.sizes);
+        const total = SIZE_ORDER.reduce((a,k)=>a+(b.sizes[k]||0),0);
+        const meta = {...metaFields, lineSeq};
         out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
       });
     });
@@ -205,30 +224,27 @@ export default function App(){
   };
 
   const downloadPDF = ()=>{ const doc=renderPDF(labels); const fn=`labels_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.pdf`; doc.save(fn); };
-  const downloadZPL = ()=>{ const zpl=renderAllZPL(labels); const blob=new Blob([zpl],{type:"text/plain;charset=utf-8"}); saveAs(blob, `labels_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.zpl`); };
+  const downloadZPL = ()=>{ const zpl=renderAllZPL(labels); const blob=new Blob([zpl],{type:\"text/plain;charset=utf-8\"}); saveAs(blob, `labels_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.zpl`); };
   const downloadLogs = ()=>{
     const ts=new Date().toISOString(); const rowsOut=[];
     labels.forEach(({meta,box})=>{
-      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, line:meta.line, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
+      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, line_in_csv:meta.lineSeq, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
     });
     csvDownload(`label_log_${ts.replace(/[:]/g,'-')}.csv`, rowsOut);
   };
 
   const runTests = ()=>{
     const logs=[]; const ok=(n,c)=>logs.push(`${c?"✓":"✗"} ${n}`);
-    ok("alias XXL→2X", normalizeSizeToken("XXL")==="2X");
-    ok("alias 2XL→2X", normalizeSizeToken("2XL")==="2X");
-    ok("alias 3XL→3X", normalizeSizeToken("3XL")==="3X");
-    ok("ignore XS", normalizeSizeToken("XS")==="");
-    // Capacity band tests
-    const sizesPF = normalizeSizes({S:82}); // printers fold SS -> first box must cap S-XL at 72 (D)
-    const bPF = splitByCapacityInOrder(sizesPF, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
-    const firstPF_SXL = bPF[0].sizes.S + bPF[0].sizes.M + bPF[0].sizes.L + bPF[0].sizes.XL;
-    ok("PF S-XL box cap ≤72 (D)", firstPF_SXL <= 72);
-    const sizesPB = normalizeSizes({S:82}); // polybag SS -> cap S-XL at 60 (D)
-    const bPB = splitByCapacityInOrder(sizesPB, CAP_POLYBAG.SS.SXL, CAP_POLYBAG.SS.BIG).boxes;
-    const firstPB_SXL = bPB[0].sizes.S + bPB[0].sizes.M + bPB[0].sizes.L + bPB[0].sizes.XL;
-    ok("Polybag S-XL box cap ≤60 (D)", firstPB_SXL <= 60);
+    // D full test: 100 S under PF/SS should produce at least 1 full D (72) then tail 28 -> C (60 cap) or B (48) -> should choose B since 28 fits B total 48 and SXL 48
+    const sizes = normalizeSizes({S:100});
+    const r = splitHybridStrict(sizes, PF.SS.SXL, PF.SS.BIG, PF.SS.SXL).boxes;
+    ok("No single box exceed caps", r.every(b=>{
+      const sxl = b.sizes.S + b.sizes.M + b.sizes.L + b.sizes.XL;
+      const big = b.sizes["2X"] + b.sizes["3X"] + b.sizes["4X"] + b.sizes["5X"];
+      const tot = sxl + big;
+      const capSXL = PF.SS.SXL[b.boxType], capBIG = PF.SS.BIG[b.boxType], capT = PF.SS.SXL[b.boxType];
+      return sxl<=capSXL && big<=capBIG && tot<=capT;
+    }));
     setTests(logs);
   };
 
@@ -237,11 +253,11 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p>Fixes: Color = <b>COLOR NAME</b> column; strict S‑XL caps (PF:72, Polybag:60) per box; size aliases; per‑line validation.</p>
+      <p><span className="pill">Hybrid packing</span>: D-first for fulls, then smallest that fits — <b>never exceeds</b> S-XL cap, 2X–5X cap, or total cap.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
-          <div><b>Drag & drop multiple CSVs</b><div style={{fontSize:12, color:'#6b7280'}}>We merge and process them together</div></div>
+          <div><b>Drop CSVs</b><div className="small">We merge and process them together</div></div>
           <input type="file" accept=".csv" multiple onChange={e=>onFiles(e.target.files)} />
         </div>
       </div>
@@ -251,26 +267,26 @@ export default function App(){
         <button className="btn btn-dark" onClick={downloadPDF} disabled={!labels.length || blockExports} title={blockExports?'Fix input issues first':''}>Download 4×8 PDF</button>
         <button className="btn btn-dark" onClick={downloadZPL} disabled={!labels.length || blockExports} title={blockExports?'Fix input issues first':''}>Download RAW ZPL</button>
         <button className="btn btn-gray" onClick={downloadLogs} disabled={!labels.length}>Download Label CSV Log</button>
-        <button className="btn btn-blue" onClick={runTests}>Run built-in tests</button>
+        <button className="btn btn-blue" onClick={runTests}>Run tests</button>
       </div>
 
       {errors.length>0 && (
         <div className="card warn" style={{marginBottom:16}}>
           <b>Input issues</b>
           <ul>{errors.map((e,i)=><li key={i} style={{fontSize:13}}>{e}</li>)}</ul>
-          <div style={{fontSize:12, marginTop:8}}>Labels export is disabled until these are resolved.</div>
+          <div className="small">Exports disabled until resolved.</div>
         </div>
       )}
 
       {labels.length>0 && !blockExports && (
         <div className="card ok" style={{marginBottom:16}}>
-          <b>Ready</b> – Totals align with line quantities. You can export PDF/ZPL.
+          <b>Ready</b> – Totals align with line qty. Export PDF/ZPL.
         </div>
       )}
 
       {labels.length>0 && (
         <div style={{marginBottom:16}}>
-          <h3>Visual preview (first 20 labels)</h3>
+          <h3>Preview (first 20)</h3>
           <div className="grid">
             {preview.map((l,i)=>(
               <div key={i} className="card">
@@ -282,14 +298,14 @@ export default function App(){
                 <div><b>Customer PO#:</b> {l.meta.po}</div>
                 <div><b>Work Order:</b> {l.meta.wo}</div>
                 <div className="grid-1">
-                  {SIZE_ORDER.map(sk=>(
+                  {SIZE_ORDER.map((sk)=>(
                     <div key={sk} style={{display:'flex', justifyContent:'space-between'}}><b>{sk}:</b><span>{l.box.sizes[sk]||""}</span></div>
                   ))}
                 </div>
                 <div style={{marginTop:8}}><b>Total:</b> {l.box.total}</div>
                 <div>BOX {l.box.boxIndex} OF {l.box.boxCount}</div>
                 <div>Box Size: {l.box.boxType} {BOX_DIMENSIONS[l.box.boxType]||""}</div>
-                <div>Line 1</div>
+                <div>Line {l.meta.lineSeq}</div>
                 <Barcode value={l.meta.pick} />
               </div>
             ))}
@@ -302,7 +318,7 @@ export default function App(){
           <table>
             <thead>
               <tr>
-                <th>Pick</th><th>Item</th><th>WO</th><th>Line</th><th>Box</th><th>Type</th>
+                <th>Pick</th><th>Item</th><th>WO</th><th>CSV Line</th><th>Box</th><th>Type</th>
                 <th>S</th><th>M</th><th>L</th><th>XL</th><th>2X</th><th>3X</th><th>4X</th><th>5X</th><th>Total</th>
               </tr>
             </thead>
@@ -312,7 +328,7 @@ export default function App(){
                   <td>{l.meta.pick}</td>
                   <td>{l.meta.item}</td>
                   <td>{l.meta.wo}</td>
-                  <td>{l.meta.line}</td>
+                  <td>{l.meta.lineSeq}</td>
                   <td>{l.box.boxIndex} / {l.box.boxCount}</td>
                   <td>{l.box.boxType}</td>
                   <td>{l.box.sizes.S||""}</td>
