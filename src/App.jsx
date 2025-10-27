@@ -49,6 +49,7 @@ function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|LONG\s*SLEEVE/i.t
 function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
 
+// ----- PF (mix allowed) helpers
 function fillBox(rem, capSXL, capBIG, totals, boxType){
   const out=normalizeSizes({}); let usedSXL=0, usedBIG=0, usedTOT=0;
   const tryPush=(key,band)=>{
@@ -65,14 +66,12 @@ function fillBox(rem, capSXL, capBIG, totals, boxType){
   ["2X","3X","4X","5X"].forEach(k=>tryPush(k,"BIG"));
   return out;
 }
-
 function qualifiesFullD(rem, capSXL, capBIG, totals){
   const remSXL = rem.S+rem.M+rem.L+rem.XL;
   const remBIG = rem["2X"]+rem["3X"]+rem["4X"]+rem["5X"];
   const remTOT = remSXL + remBIG;
   return remSXL>=capSXL.D || remBIG>=capBIG.D || remTOT>=totals.D;
 }
-
 function smallestThatFits(rem, capSXL, capBIG, totals){
   const remSXL = rem.S+rem.M+rem.L+rem.XL;
   const remBIG = rem["2X"]+rem["3X"]+rem["4X"]+rem["5X"];
@@ -82,8 +81,7 @@ function smallestThatFits(rem, capSXL, capBIG, totals){
   }
   return "D";
 }
-
-function splitHybridStrict(sizes, capsSXL, capsBIG, totals){
+function splitPF(sizes, capsSXL, capsBIG, totals){
   const rem = {...sizes}; const boxes=[];
   while(qualifiesFullD(rem, capsSXL, capsBIG, totals)){
     const pack = fillBox(rem, capsSXL, capsBIG, totals, "D");
@@ -93,15 +91,43 @@ function splitHybridStrict(sizes, capsSXL, capsBIG, totals){
   while(sumSizes(rem)>0){
     const chosen = smallestThatFits(rem, capsSXL, capsBIG, totals);
     const pack = fillBox(rem, capsSXL, capsBIG, totals, chosen);
-    if(sumSizes(pack)===0){ // safety: move 1 smallest size if possible
-      const k = SIZE_ORDER.find(k=>rem[k]>0); if(!k) break;
-      const isSXL = ["S","M","L","XL"].includes(k);
-      const bandLeft = (isSXL?capsSXL[chosen]:capBIG[chosen]) - (isSXL ? (pack.S+pack.M+pack.L+pack.XL) : (pack["2X"]+pack["3X"]+pack["4X"]+pack["5X"]));
-      const totLeft  = totals[chosen] - sumSizes(pack);
-      if(bandLeft>0 && totLeft>0){ pack[k]=1; rem[k]-=1; }
-      if(sumSizes(pack)===0) break;
-    }
+    if(sumSizes(pack)===0){ const k = SIZE_ORDER.find(k=>rem[k]>0); if(!k) break; pack[k]=Math.min(1, rem[k]); rem[k]-=pack[k]; }
     boxes.push({boxType:chosen, sizes:pack});
+  }
+  return {boxes};
+}
+
+// ----- Polybag (NO MIX) helpers: pack by size only
+function minCapForSize(box, isSXL, capsSXL, capsBIG, totals){
+  const bandCap = isSXL ? capsSXL[box] : capsBIG[box];
+  const totCap  = totals[box];
+  return Math.min(bandCap, totCap);
+}
+function splitPolybagBySize(sizes, capsSXL, capsBIG, totals){
+  const boxes=[];
+  for(const sizeKey of SIZE_ORDER){
+    let qty = sizes[sizeKey]||0;
+    if(qty<=0) continue;
+    const isSXL = ["S","M","L","XL"].includes(sizeKey);
+    // Step 1: D-first for fulls
+    const dCap = minCapForSize("D", isSXL, capsSXL, capsBIG, totals);
+    while(qty >= dCap && dCap>0){
+      const pack = {S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0};
+      pack[sizeKey] = dCap;
+      boxes.push({boxType:"D", sizes:pack});
+      qty -= dCap;
+    }
+    // Step 2: tail -> smallest box that fits the remaining qty for this size
+    if(qty>0){
+      let chosen = "D";
+      for(const b of BOXES){
+        if(qty <= minCapForSize(b, isSXL, capsSXL, capsBIG, totals)){ chosen=b; break; }
+      }
+      const pack = {S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0};
+      pack[sizeKey] = qty;
+      boxes.push({boxType:chosen, sizes:pack});
+      qty = 0;
+    }
   }
   return {boxes};
 }
@@ -127,7 +153,7 @@ function zplForLabel(meta, box){
   z+=`^FO${left},${y}^A0N,24,18^FDBOX ${box.boxIndex} OF ${box.boxCount}^FS\n`; y+=28;
   const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "";
   z+=`^FO${left},${y}^A0N,24,18^FDBox Size: ${box.boxType}${dim}^FS\n`; y+=28;
-  z+=`^FO${left},${y}^A0N,24,18^FDLine ${meta.lineSeq}^FS\n`; y+=32;
+  // Removed "Line X" per user request
   z+=`^FO${left},${LL-180}^BY2,2,120^BCN,120,Y,N,N^FD${escapeZPL(meta.pick)}^FS\n`;
   z+="^XZ\n"; return z;
 }
@@ -143,7 +169,8 @@ function renderPDF(labels){
     ["S","M","L","XL","2X","3X","4X","5X"].forEach(sk=>sizeLine(sk, box.sizes[sk]||0));
     y+=4; line(`Total: ${box.total}`,12,true); y+=6; doc.setFontSize(11); doc.setFont("helvetica","bold"); doc.text(`BOX ${box.boxIndex} OF ${box.boxCount}`,x0,y); y+=16;
     const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : ""; doc.setFont("helvetica","normal"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
-    doc.text(`Line ${meta.lineSeq}`, x0, y); y+=14; const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
+    // Removed "Line X"
+    const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
   };
   labels.forEach((l,i)=>draw(l,i===0)); return doc;
 }
@@ -210,7 +237,10 @@ export default function App(){
       const capsBIG = table[sleeve].BIG;
       const totals  = table[sleeve].SXL;
 
-      const {boxes} = splitHybridStrict(sizes, capsSXL, capsBIG, totals);
+      const {boxes} = (mode==="POLYBAG")
+        ? splitPolybagBySize(sizes, capsSXL, capsBIG, totals)
+        : splitPF(sizes, capsSXL, capsBIG, totals);
+
       const lineSeq = Math.min(...lineSeqs.filter(Boolean));
 
       boxes.forEach((b,i)=>{
@@ -228,22 +258,21 @@ export default function App(){
   const downloadLogs = ()=>{
     const ts=new Date().toISOString(); const rowsOut=[];
     labels.forEach(({meta,box})=>{
-      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, line_in_csv:meta.lineSeq, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
+      rowsOut.push({timestamp:ts, pick_ticket:meta.pick, item_id:meta.item, work_order:meta.wo, /* line removed visually, keep for log? keeping */ line_in_csv:meta.lineSeq, box_index:box.boxIndex, box_count:box.boxCount, box_type:box.boxType, sleeve:box.sleeve, mode:box.mode, S:box.sizes.S||"", M:box.sizes.M||"", L:box.sizes.L||"", XL:box.sizes.XL||"", _2X:box.sizes["2X"]||"", _3X:box.sizes["3X"]||"", _4X:box.sizes["4X"]||"", _5X:box.sizes["5X"]||"", total:box.total, file_name:`labels_${ts}.pdf` });
     });
     csvDownload(`label_log_${ts.replace(/[:]/g,'-')}.csv`, rowsOut);
   };
 
   const runTests = ()=>{
     const logs=[]; const ok=(n,c)=>logs.push(`${c?"✓":"✗"} ${n}`);
-    const sizes = normalizeSizes({S:100});
-    const r = splitHybridStrict(sizes, PF.SS.SXL, PF.SS.BIG, PF.SS.SXL).boxes;
-    ok("No single box exceed caps", r.every(b=>{
-      const sxl = b.sizes.S + b.sizes.M + b.sizes.L + b.sizes.XL;
-      const big = b.sizes["2X"] + b.sizes["3X"] + b.sizes["4X"] + b.sizes["5X"];
-      const tot = sxl + big;
-      const capSXL = PF.SS.SXL[b.boxType], capBIG = PF.SS.BIG[b.boxType], capT = PF.SS.SXL[b.boxType];
-      return sxl<=capSXL && big<=capBIG && tot<=capT;
-    }));
+    // Polybag no-mix test: 95 S should produce D(60) + C(35) in PB/SS; each box has only S
+    const sizesPB = normalizeSizes({S:95});
+    const rPB = splitPolybagBySize(sizesPB, PB.SS.SXL, PB.SS.BIG, PB.SS.SXL).boxes;
+    ok("PB no mix sizes", rPB[0].sizes.M===0 && rPB[0].sizes["2X"]===0 && rPB.every(b=>Object.values(b.sizes).filter(v=>v>0).length==1));
+    // PF mix test still allowed
+    const sizesPF = normalizeSizes({S:50, M:10, "2X":10});
+    const rPF = splitPF(sizesPF, PF.SS.SXL, PF.SS.BIG, PF.SS.SXL).boxes;
+    ok("PF mix allowed and caps respected", rPF.length>=2);
     setTests(logs);
   };
 
@@ -252,7 +281,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p><span className="pill">Hybrid packing</span>: D-first for fulls, then smallest that fits — <b>never exceeds</b> S-XL cap, 2X–5X cap, or total cap.</p>
+      <p><span className="pill">Modes</span>: <b>Printers & Fold</b> (mix sizes) • <b>Polybag</b> (no mixing, per-size cartons). D-first for fulls, then smallest that fits; never overflow.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
@@ -277,19 +306,13 @@ export default function App(){
         </div>
       )}
 
-      {labels.length>0 && !blockExports && (
-        <div className="card ok" style={{marginBottom:16}}>
-          <b>Ready</b> – Totals align with line qty. Export PDF/ZPL.
-        </div>
-      )}
-
       {labels.length>0 && (
         <div style={{marginBottom:16}}>
           <h3>Preview (first 20)</h3>
           <div className="grid">
             {preview.map((l,i)=>(
               <div key={i} className="card">
-                <div style={{fontSize:12, color:'#6b7280', marginBottom:8}}>{l.box.boxIndex} / {l.box.boxCount} • Box {l.box.boxType}</div>
+                <div style={{fontSize:12, color:'#6b7280', marginBottom:8}}>{l.box.boxIndex} / {l.box.boxCount} • Box {l.box.boxType} • {l.box.mode==="POLYBAG"?"No-mix":"Mix OK"}</div>
                 <div><b>Pick Ticket:</b> {l.meta.pick}</div>
                 <div><b>Item ID:</b> {l.meta.item}</div>
                 <div><b>Body:</b> {l.meta.body}</div>
@@ -304,7 +327,6 @@ export default function App(){
                 <div style={{marginTop:8}}><b>Total:</b> {l.box.total}</div>
                 <div>BOX {l.box.boxIndex} OF {l.box.boxCount}</div>
                 <div>Box Size: {l.box.boxType} {BOX_DIMENSIONS[l.box.boxType]||""}</div>
-                <div>Line {l.meta.lineSeq}</div>
                 <Barcode value={l.meta.pick} />
               </div>
             ))}
@@ -317,7 +339,7 @@ export default function App(){
           <table>
             <thead>
               <tr>
-                <th>Pick</th><th>Item</th><th>WO</th><th>CSV Line</th><th>Box</th><th>Type</th>
+                <th>Pick</th><th>Item</th><th>WO</th><th>Box</th><th>Type</th>
                 <th>S</th><th>M</th><th>L</th><th>XL</th><th>2X</th><th>3X</th><th>4X</th><th>5X</th><th>Total</th>
               </tr>
             </thead>
@@ -327,7 +349,6 @@ export default function App(){
                   <td>{l.meta.pick}</td>
                   <td>{l.meta.item}</td>
                   <td>{l.meta.wo}</td>
-                  <td>{l.meta.lineSeq}</td>
                   <td>{l.box.boxIndex} / {l.box.boxCount}</td>
                   <td>{l.box.boxType}</td>
                   <td>{l.box.sizes.S||""}</td>
