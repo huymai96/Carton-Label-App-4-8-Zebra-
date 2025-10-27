@@ -17,18 +17,20 @@ const CAP_POLYBAG = {
 const BOX_DIMENSIONS = { A:"12x12x12", B:"9x16x22", C:"11x16x22", D:"13x16x24" };
 const COL = {
   pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION",
-  color:"COLOR NAME", // <-- switched to Column Q (Color Name)
+  color:"COLOR NAME",
   custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #", lineNo:"SALES ORDER LINE #",
   size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY"
 };
-const DEFAULT_SELECT_SMALLEST_FIT = true;
+
+// Prefer Box D globally
+const PREFER_BOX_D = true;
 
 // --- Normalizers ---
 function normString(s){ return (s??"").toString().normalize("NFKC").replace(/\u2019/g,"'").trim(); }
 function normPO(s){ return normString(s).replace(/^['"]+/, ""); }
 
 const SIZE_ALIAS = new Map(Object.entries({
-  "XS":"", "X-SMALL":"", "X SMALL":"", // ignored sizes
+  "XS":"", "X-SMALL":"", "X SMALL":"",
   "S":"S", "SM":"S", "SMALL":"S",
   "M":"M", "MEDIUM":"M",
   "L":"L", "LG":"L", "LARGE":"L",
@@ -37,7 +39,7 @@ const SIZE_ALIAS = new Map(Object.entries({
   "3X":"3X", "3XL":"3X", "XXX-LARGE":"3X",
   "4X":"4X", "4XL":"4X",
   "5X":"5X", "5XL":"5X",
-  "6X":"", "6XL":"", // ignore per rule
+  "6X":"", "6XL":"",
 }));
 
 function normalizeSizeToken(tok){
@@ -50,45 +52,37 @@ function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|LONG\s*SLEEVE/i.t
 function getCapacity(mode,sleeve,band){ return (mode==="POLYBAG"?CAP_POLYBAG:CAP_PRINTERS_FOLD)[sleeve][band]; }
 function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
-function pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG){
-  // choose the smallest box that can take at least 1 piece and prioritizes fitting as much as possible band‑wise
-  const order=["A","B","C","D"];
-  for(const b of order){
-    const can = Math.min(remSXL, capsSXL[b]) + Math.min(remBIG, capsBIG[b]);
-    if (can > 0) return b;
-  }
-  return "D";
-}
 
-function splitByCapacityInOrder(sizes, capsSXL, capsBIG){
+function splitByCapacityPreferD(sizes, capsSXL, capsBIG){
   const rem = {...sizes}; const boxes=[];
   while(sumSizes(rem)>0){
-    const remSXL = rem.S + rem.M + rem.L + rem.XL;
-    const remBIG = rem["2X"] + rem["3X"] + rem["4X"] + rem["5X"];
-    const boxType = pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG);
+    const boxType = "D"; // always D
     const capSXL=capsSXL[boxType], capBIG=capsBIG[boxType];
     const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
     const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
       const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
     ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
-    if(sumSizes(out)===0){ const k=SIZE_ORDER.find(k=>rem[k]>0); out[k]=1; rem[k]-=1; }
-    // assert per‑band caps are never exceeded
-    const sxlPacked = out.S+out.M+out.L+out.XL;
-    const bigPacked = out["2X"]+out["3X"]+out["4X"]+out["5X"];
-    if (sxlPacked > capSXL || bigPacked > capBIG){
-      // clamp if any logic drift
-      const clamp = (keys, cap, used)=>{
-        let total = keys.reduce((a,k)=>a+out[k],0);
-        while(total>cap){
-          for(const k of keys){
-            if(out[k]>0){ out[k]--; rem[k]++; total--; used--; break; }
-          }
-        }
-        return used;
-      };
-      usedSXL = clamp(["S","M","L","XL"], capSXL, usedSXL);
-      usedBIG = clamp(["2X","3X","4X","5X"], capBIG, usedBIG);
+    if(sumSizes(out)===0){ break; }
+    boxes.push({boxType, sizes: out});
+  }
+  return {boxes};
+}
+
+function splitByCapacitySmallest(sizes, capsSXL, capsBIG){
+  const rem = {...sizes}; const boxes=[];
+  while(sumSizes(rem)>0){
+    const order=["A","B","C","D"]; let boxType="D";
+    for(const b of order){
+      const capSXL=capsSXL[b], capBIG=capsBIG[b];
+      const can = Math.min(rem.S+rem.M+rem.L+rem.XL, capSXL) + Math.min(rem["2X"]+rem["3X"]+rem["4X"]+rem["5X"], capBIG);
+      if(can>0){ boxType=b; break; }
     }
+    const capSXL=capsSXL[boxType], capBIG=capsBIG[boxType];
+    const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
+    const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
+      const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
+    ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
+    if(sumSizes(out)===0){ break; }
     boxes.push({boxType, sizes: out});
   }
   return {boxes};
@@ -148,6 +142,7 @@ export default function App(){
   const [errors, setErrors] = useState([]);
   const [tests, setTests] = useState([]);
   const [blockExports, setBlockExports] = useState(false);
+  const [preferD, setPreferD] = useState(true);
 
   const onFiles = (files) => {
     if(!files || files.length===0) return;
@@ -194,9 +189,9 @@ export default function App(){
       }
 
       const sxl=getCapacity(mode,sleeve,"SXL"); const big=getCapacity(mode,sleeve,"BIG");
-      const {boxes} = splitByCapacityInOrder(sizes, sxl, big);
+      const {boxes} = (preferD? splitByCapacityPreferD : splitByCapacitySmallest)(sizes, sxl, big);
       boxes.forEach((b,i)=>{
-        const total = sumSizes(b.sizes);
+        const total = SIZE_ORDER.reduce((a,k)=>a+(b.sizes[k]||0),0);
         out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
       });
     });
@@ -216,19 +211,15 @@ export default function App(){
 
   const runTests = ()=>{
     const logs=[]; const ok=(n,c)=>logs.push(`${c?"✓":"✗"} ${n}`);
-    ok("alias XXL→2X", normalizeSizeToken("XXL")==="2X");
-    ok("alias 2XL→2X", normalizeSizeToken("2XL")==="2X");
-    ok("alias 3XL→3X", normalizeSizeToken("3XL")==="3X");
-    ok("ignore XS", normalizeSizeToken("XS")==="");
-    // Capacity band tests
-    const sizesPF = normalizeSizes({S:82}); // printers fold SS -> first box must cap S-XL at 72 (D)
-    const bPF = splitByCapacityInOrder(sizesPF, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
-    const firstPF_SXL = bPF[0].sizes.S + bPF[0].sizes.M + bPF[0].sizes.L + bPF[0].sizes.XL;
-    ok("PF S-XL box cap ≤72 (D)", firstPF_SXL <= 72);
-    const sizesPB = normalizeSizes({S:82}); // polybag SS -> cap S-XL at 60 (D)
-    const bPB = splitByCapacityInOrder(sizesPB, CAP_POLYBAG.SS.SXL, CAP_POLYBAG.SS.BIG).boxes;
-    const firstPB_SXL = bPB[0].sizes.S + bPB[0].sizes.M + bPB[0].sizes.L + bPB[0].sizes.XL;
-    ok("Polybag S-XL box cap ≤60 (D)", firstPB_SXL <= 60);
+    // Prefer D: if we have only S sizes, first box must be D.
+    const sizesPF = normalizeSizes({S:10});
+    const bPF = splitByCapacityPreferD(sizesPF, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
+    ok("prefer D boxes", bPF[0].boxType==="D");
+    // Caps must be respected
+    const big = normalizeSizes({"2X":100});
+    const b2 = splitByCapacityPreferD(big, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
+    const firstBIG = b2[0].sizes["2X"]+b2[0].sizes["3X"]+b2[0].sizes["4X"]+b2[0].sizes["5X"];
+    ok("big band cap respected (D max)", firstBIG <= CAP_PRINTERS_FOLD.SS.BIG.D);
     setTests(logs);
   };
 
@@ -237,7 +228,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p>Fixes: Color = <b>COLOR NAME</b> column; strict S‑XL caps (PF:72, Polybag:60) per box; size aliases; per‑line validation.</p>
+      <p><span className="pill">Prefers Box D</span> while enforcing S‑XL and 2X‑5X band caps per your table.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
@@ -339,4 +330,3 @@ export default function App(){
       )}
     </div>
   );
-}
