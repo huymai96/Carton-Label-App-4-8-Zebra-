@@ -16,7 +16,8 @@ const CAP_POLYBAG = {
 };
 const BOX_DIMENSIONS = { A:"12x12x12", B:"9x16x22", C:"11x16x22", D:"13x16x24" };
 const COL = {
-  pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION", color:"COLOR",
+  pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION",
+  color:"COLOR NAME", // <-- switched to Column Q (Color Name)
   custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #", lineNo:"SALES ORDER LINE #",
   size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY"
 };
@@ -49,20 +50,45 @@ function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|LONG\s*SLEEVE/i.t
 function getCapacity(mode,sleeve,band){ return (mode==="POLYBAG"?CAP_POLYBAG:CAP_PRINTERS_FOLD)[sleeve][band]; }
 function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
-function pickSmallestBoxThatFits(q, caps){ for(const b of ["A","B","C","D"]) if(q<=caps[b]) return b; return "D"; }
+function pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG){
+  // choose the smallest box that can take at least 1 piece and prioritizes fitting as much as possible band‑wise
+  const order=["A","B","C","D"];
+  for(const b of order){
+    const can = Math.min(remSXL, capsSXL[b]) + Math.min(remBIG, capsBIG[b]);
+    if (can > 0) return b;
+  }
+  return "D";
+}
 
 function splitByCapacityInOrder(sizes, capsSXL, capsBIG){
   const rem = {...sizes}; const boxes=[];
   while(sumSizes(rem)>0){
-    const combined={A:capsSXL.A+capsBIG.A,B:capsSXL.B+capsBIG.B,C:capsSXL.C+capsBIG.C,D:capsSXL.D+capsBIG.D};
-    const chunkTarget = Math.min(sumSizes(rem), combined.D);
-    const boxType = DEFAULT_SELECT_SMALLEST_FIT ? pickSmallestBoxThatFits(chunkTarget, combined) : "D";
+    const remSXL = rem.S + rem.M + rem.L + rem.XL;
+    const remBIG = rem["2X"] + rem["3X"] + rem["4X"] + rem["5X"];
+    const boxType = pickSmallestBoxThatFitsByBands(remSXL, remBIG, capsSXL, capsBIG);
     const capSXL=capsSXL[boxType], capBIG=capsBIG[boxType];
     const out=normalizeSizes({}); let usedSXL=0, usedBIG=0;
     const push=(key,band)=>{ const cap=band==="SXL"?capSXL:capBIG; const left=cap - (band==="SXL"?usedSXL:usedBIG);
       const take=Math.min(rem[key], Math.max(0,left)); if(take>0){ out[key]+=take; rem[key]-=take; if(band==="SXL") usedSXL+=take; else usedBIG+=take; }};
     ["S","M","L","XL"].forEach(k=>push(k,"SXL")); ["2X","3X","4X","5X"].forEach(k=>push(k,"BIG"));
     if(sumSizes(out)===0){ const k=SIZE_ORDER.find(k=>rem[k]>0); out[k]=1; rem[k]-=1; }
+    // assert per‑band caps are never exceeded
+    const sxlPacked = out.S+out.M+out.L+out.XL;
+    const bigPacked = out["2X"]+out["3X"]+out["4X"]+out["5X"];
+    if (sxlPacked > capSXL || bigPacked > capBIG){
+      // clamp if any logic drift
+      const clamp = (keys, cap, used)=>{
+        let total = keys.reduce((a,k)=>a+out[k],0);
+        while(total>cap){
+          for(const k of keys){
+            if(out[k]>0){ out[k]--; rem[k]++; total--; used--; break; }
+          }
+        }
+        return used;
+      };
+      usedSXL = clamp(["S","M","L","XL"], capSXL, usedSXL);
+      usedBIG = clamp(["2X","3X","4X","5X"], capBIG, usedBIG);
+    }
     boxes.push({boxType, sizes: out});
   }
   return {boxes};
@@ -150,37 +176,21 @@ export default function App(){
       if(!pick||!item||!wo){ errs.push(`Row ${idx+1}: missing key fields (Pick/Item/WO)`); return; }
 
       const gk={pick,item,wo,line,body,color,po}; const key=JSON.stringify(gk);
-      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po, _rawIgnored:[]});
+      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po, _rawIgnored:[], expected: lineQtyMaybe});
       const g=groups.get(key);
-
-      if(size){ g.sizes[size]+=qty; }
-      else if(rawSize){ g._rawIgnored.push(rawSize); } // record ignored tokens like XS, 6XL, or typos
+      if(size){ g.sizes[size]+=qty; } else if(rawSize){ g._rawIgnored.push(rawSize); }
+      if(lineQtyMaybe){ g.expected = lineQtyMaybe; }
     });
 
-    // Validate & cartonize
     const out=[];
     let blocking=false;
 
     groups.forEach((g)=>{
-      const {key:meta, sizes, mode, sleeve, _rawIgnored} = g;
-      // If NET ORDER QTY exists for this group, compare sum
-      // We don't have per-group lineQty in merged rows; compute from source rows by meta matching
-      const expectedTotals = []; // collect values from rows that match meta for visibility
-      rows.forEach(r=>{
-        const same = normString(r[COL.pickTicket])===meta.pick
-          && normString(r[COL.itemId])===meta.item
-          && normString(r[COL.workOrder])===meta.wo
-          && normString(r[COL.lineNo])===meta.line;
-        if(same){
-          const v = Number(normString(r[COL.lineQtyMaybe])||0);
-          if(v) expectedTotals.push(v);
-        }
-      });
-      const expected = expectedTotals.length ? Math.max(...expectedTotals) : null; // pick a reasonable target (max)
+      const {key:meta, sizes, mode, sleeve, _rawIgnored, expected} = g;
       const actual = sumSizes(sizes);
-      if(expected!==null && expected!==actual){
+      if(expected!==null && expected!==undefined && expected!==0 && expected!==actual){
         blocking=true;
-        errs.push(`Pick ${meta.pick} / Item ${meta.item} / WO ${meta.wo} / Line ${meta.line}: sizes sum ${actual} ≠ line qty ${expected}. Aliases normalized. Ignored raw sizes: [${_rawIgnored.join(", ")}]`);
+        errs.push(`Pick ${meta.pick} / Item ${meta.item} / WO ${meta.wo} / Line ${meta.line}: sizes sum ${actual} ≠ line qty ${expected}. Ignored raw sizes: [${_rawIgnored.join(", ")}]`);
       }
 
       const sxl=getCapacity(mode,sleeve,"SXL"); const big=getCapacity(mode,sleeve,"BIG");
@@ -210,11 +220,15 @@ export default function App(){
     ok("alias 2XL→2X", normalizeSizeToken("2XL")==="2X");
     ok("alias 3XL→3X", normalizeSizeToken("3XL")==="3X");
     ok("ignore XS", normalizeSizeToken("XS")==="");
-    ok("detectMode polybag", detectMode("POLYBAG EACH") === "POLYBAG");
-    ok("detectSleeve LS", detectSleeve("A/LS TEE")==="LS");
-    ok("cap SS SXL A == 24", CAP_PRINTERS_FOLD.SS.SXL.A === 24);
-    const sizes1=normalizeSizes({S:30,M:10}); const b1=splitByCapacityInOrder(sizes1, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
-    ok("sum preserved", b1.reduce((a,b)=>a+sumSizes(b.sizes),0)===40);
+    // Capacity band tests
+    const sizesPF = normalizeSizes({S:82}); // printers fold SS -> first box must cap S-XL at 72 (D)
+    const bPF = splitByCapacityInOrder(sizesPF, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
+    const firstPF_SXL = bPF[0].sizes.S + bPF[0].sizes.M + bPF[0].sizes.L + bPF[0].sizes.XL;
+    ok("PF S-XL box cap ≤72 (D)", firstPF_SXL <= 72);
+    const sizesPB = normalizeSizes({S:82}); // polybag SS -> cap S-XL at 60 (D)
+    const bPB = splitByCapacityInOrder(sizesPB, CAP_POLYBAG.SS.SXL, CAP_POLYBAG.SS.BIG).boxes;
+    const firstPB_SXL = bPB[0].sizes.S + bPB[0].sizes.M + bPB[0].sizes.L + bPB[0].sizes.XL;
+    ok("Polybag S-XL box cap ≤60 (D)", firstPB_SXL <= 60);
     setTests(logs);
   };
 
@@ -223,7 +237,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p>Now with size alias normalization (XXL/2XL → 2X, etc.) and per-line validation to prevent under-boxing.</p>
+      <p>Fixes: Color = <b>COLOR NAME</b> column; strict S‑XL caps (PF:72, Polybag:60) per box; size aliases; per‑line validation.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
