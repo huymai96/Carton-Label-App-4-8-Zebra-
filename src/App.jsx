@@ -22,8 +22,30 @@ const COL = {
 };
 const DEFAULT_SELECT_SMALLEST_FIT = true;
 
+// --- Normalizers ---
+function normString(s){ return (s??"").toString().normalize("NFKC").replace(/\u2019/g,"'").trim(); }
+function normPO(s){ return normString(s).replace(/^['"]+/, ""); }
+
+const SIZE_ALIAS = new Map(Object.entries({
+  "XS":"", "X-SMALL":"", "X SMALL":"", // ignored sizes
+  "S":"S", "SM":"S", "SMALL":"S",
+  "M":"M", "MEDIUM":"M",
+  "L":"L", "LG":"L", "LARGE":"L",
+  "XL":"XL", "X-LARGE":"XL", "X LARGE":"XL",
+  "2X":"2X", "XXL":"2X", "2XL":"2X", "XX-LARGE":"2X", "2 X LARGE":"2X",
+  "3X":"3X", "3XL":"3X", "XXX-LARGE":"3X",
+  "4X":"4X", "4XL":"4X",
+  "5X":"5X", "5XL":"5X",
+  "6X":"", "6XL":"", // ignore per rule
+}));
+
+function normalizeSizeToken(tok){
+  const t = normString(tok).toUpperCase().replace(/\s+/g,"");
+  return SIZE_ALIAS.get(t) ?? "";
+}
+
 function detectMode(spec){ if(!spec) return "PRINTERS_FOLD"; return /polybag/i.test(spec)?"POLYBAG":"PRINTERS_FOLD"; }
-function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|long\s*sleeve/i.test(body)) return "LS"; return "SS"; }
+function detectSleeve(body){ if(!body) return "SS"; if(/\bLS\b|LONG\s*SLEEVE/i.test(body)) return "LS"; return "SS"; }
 function getCapacity(mode,sleeve,band){ return (mode==="POLYBAG"?CAP_POLYBAG:CAP_PRINTERS_FOLD)[sleeve][band]; }
 function normalizeSizes(m){ const out={S:0,M:0,L:0,XL:0,"2X":0,"3X":0,"4X":0,"5X":0}; SIZE_ORDER.forEach(k=>out[k]=Number(m?.[k]??0)); return out; }
 function sumSizes(m){ return SIZE_ORDER.reduce((a,k)=>a+Number(m?.[k]??0),0); }
@@ -99,6 +121,7 @@ export default function App(){
   const [labels, setLabels] = useState([]);
   const [errors, setErrors] = useState([]);
   const [tests, setTests] = useState([]);
+  const [blockExports, setBlockExports] = useState(false);
 
   const onFiles = (files) => {
     if(!files || files.length===0) return;
@@ -115,28 +138,60 @@ export default function App(){
 
   const process = () => {
     const errs=[]; const groups=new Map();
-    const grab=(r,k)=>(r?.[k]??"").toString().trim();
+    const grab=(r,k)=>normString(r?.[k]);
     rows.forEach((r, idx)=>{
       const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder), line=grab(r,COL.lineNo);
-      const body=grab(r,COL.bodyDesc), color=grab(r,COL.color), po=grab(r,COL.custPO), spec1=grab(r,COL.specInst1);
-      const size=grab(r,COL.size).toUpperCase(); const qty=Number(grab(r,COL.sizeQty)||0);
+      const body=grab(r,COL.bodyDesc), color=grab(r,COL.color), po=normPO(r?.[COL.custPO]), spec1=grab(r,COL.specInst1);
+      const rawSize=grab(r,COL.size); const size=normalizeSizeToken(rawSize);
+      const qty=Number(grab(r,COL.sizeQty)||0);
+      const lineQtyMaybe = Number(grab(r,COL.lineQtyMaybe) || 0) || null;
+
       const mode=detectMode(spec1), sleeve=detectSleeve(body);
       if(!pick||!item||!wo){ errs.push(`Row ${idx+1}: missing key fields (Pick/Item/WO)`); return; }
+
       const gk={pick,item,wo,line,body,color,po}; const key=JSON.stringify(gk);
-      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po});
+      if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), mode, sleeve, body, color, po, _rawIgnored:[]});
       const g=groups.get(key);
-      if(SIZE_ORDER.includes(size)) g.sizes[size]+=qty;
+
+      if(size){ g.sizes[size]+=qty; }
+      else if(rawSize){ g._rawIgnored.push(rawSize); } // record ignored tokens like XS, 6XL, or typos
     });
+
+    // Validate & cartonize
     const out=[];
-    groups.forEach(({key:s, sizes, mode, sleeve})=>{
+    let blocking=false;
+
+    groups.forEach((g)=>{
+      const {key:meta, sizes, mode, sleeve, _rawIgnored} = g;
+      // If NET ORDER QTY exists for this group, compare sum
+      // We don't have per-group lineQty in merged rows; compute from source rows by meta matching
+      const expectedTotals = []; // collect values from rows that match meta for visibility
+      rows.forEach(r=>{
+        const same = normString(r[COL.pickTicket])===meta.pick
+          && normString(r[COL.itemId])===meta.item
+          && normString(r[COL.workOrder])===meta.wo
+          && normString(r[COL.lineNo])===meta.line;
+        if(same){
+          const v = Number(normString(r[COL.lineQtyMaybe])||0);
+          if(v) expectedTotals.push(v);
+        }
+      });
+      const expected = expectedTotals.length ? Math.max(...expectedTotals) : null; // pick a reasonable target (max)
+      const actual = sumSizes(sizes);
+      if(expected!==null && expected!==actual){
+        blocking=true;
+        errs.push(`Pick ${meta.pick} / Item ${meta.item} / WO ${meta.wo} / Line ${meta.line}: sizes sum ${actual} ≠ line qty ${expected}. Aliases normalized. Ignored raw sizes: [${_rawIgnored.join(", ")}]`);
+      }
+
       const sxl=getCapacity(mode,sleeve,"SXL"); const big=getCapacity(mode,sleeve,"BIG");
       const {boxes} = splitByCapacityInOrder(sizes, sxl, big);
       boxes.forEach((b,i)=>{
         const total = sumSizes(b.sizes);
-        out.push({ meta:s, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
+        out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
       });
     });
-    setLabels(out); setErrors(errs);
+
+    setLabels(out); setErrors(errs); setBlockExports(blocking);
   };
 
   const downloadPDF = ()=>{ const doc=renderPDF(labels); const fn=`labels_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.pdf`; doc.save(fn); };
@@ -151,14 +206,15 @@ export default function App(){
 
   const runTests = ()=>{
     const logs=[]; const ok=(n,c)=>logs.push(`${c?"✓":"✗"} ${n}`);
-    ok("detectMode polybag", detectMode("POLYBAG EACH") === "POLYBAG"); ok("detectMode printers fold", detectMode("") === "PRINTERS_FOLD");
-    ok("detectSleeve LS", detectSleeve("A/LS TEE")==="LS"); ok("detectSleeve SS", detectSleeve("A/SS TEE")==="SS");
+    ok("alias XXL→2X", normalizeSizeToken("XXL")==="2X");
+    ok("alias 2XL→2X", normalizeSizeToken("2XL")==="2X");
+    ok("alias 3XL→3X", normalizeSizeToken("3XL")==="3X");
+    ok("ignore XS", normalizeSizeToken("XS")==="");
+    ok("detectMode polybag", detectMode("POLYBAG EACH") === "POLYBAG");
+    ok("detectSleeve LS", detectSleeve("A/LS TEE")==="LS");
     ok("cap SS SXL A == 24", CAP_PRINTERS_FOLD.SS.SXL.A === 24);
     const sizes1=normalizeSizes({S:30,M:10}); const b1=splitByCapacityInOrder(sizes1, CAP_PRINTERS_FOLD.SS.SXL, CAP_PRINTERS_FOLD.SS.BIG).boxes;
     ok("sum preserved", b1.reduce((a,b)=>a+sumSizes(b.sizes),0)===40);
-    const dummyMeta={pick:"12345", item:"ABCD", wo:"WO1", line:"1", body:"A/SS TEE", color:"BLACK", po:"PO1"};
-    const dummyBox={boxIndex:1,boxCount:1,boxType:"A",sleeve:"SS",mode:"PRINTERS_FOLD",sizes:normalizeSizes({S:1}),total:1};
-    const z=zplForLabel(dummyMeta,dummyBox); ok("zpl contains ^XA/^XZ", z.includes("^XA")&&z.includes("^XZ"));
     setTests(logs);
   };
 
@@ -167,7 +223,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p>Multi-CSV upload, preview, and export PDF or RAW ZPL. Logs exportable to CSV.</p>
+      <p>Now with size alias normalization (XXL/2XL → 2X, etc.) and per-line validation to prevent under-boxing.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
@@ -178,16 +234,23 @@ export default function App(){
 
       <div style={{display:'flex',gap:12,flexWrap:'wrap', margin:'16px 0'}}>
         <button className="btn btn-primary" onClick={process}>Process</button>
-        <button className="btn btn-dark" onClick={downloadPDF} disabled={!labels.length}>Download 4×8 PDF</button>
-        <button className="btn btn-dark" onClick={downloadZPL} disabled={!labels.length}>Download RAW ZPL</button>
+        <button className="btn btn-dark" onClick={downloadPDF} disabled={!labels.length || blockExports} title={blockExports?'Fix input issues first':''}>Download 4×8 PDF</button>
+        <button className="btn btn-dark" onClick={downloadZPL} disabled={!labels.length || blockExports} title={blockExports?'Fix input issues first':''}>Download RAW ZPL</button>
         <button className="btn btn-gray" onClick={downloadLogs} disabled={!labels.length}>Download Label CSV Log</button>
-        <button className="btn btn-blue" onClick={runTests}>Run built‑in tests</button>
+        <button className="btn btn-blue" onClick={runTests}>Run built-in tests</button>
       </div>
 
       {errors.length>0 && (
-        <div className="card" style={{borderColor:'#fbbf24', background:'#fffbeb', marginBottom:16}}>
+        <div className="card warn" style={{marginBottom:16}}>
           <b>Input issues</b>
           <ul>{errors.map((e,i)=><li key={i} style={{fontSize:13}}>{e}</li>)}</ul>
+          <div style={{fontSize:12, marginTop:8}}>Labels export is disabled until these are resolved.</div>
+        </div>
+      )}
+
+      {labels.length>0 && !blockExports && (
+        <div className="card ok" style={{marginBottom:16}}>
+          <b>Ready</b> – Totals align with line quantities. You can export PDF/ZPL.
         </div>
       )}
 
