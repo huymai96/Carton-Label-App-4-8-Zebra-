@@ -4,6 +4,7 @@ import Papa from "papaparse";
 import saveAs from "file-saver";
 import JsBarcode from "jsbarcode";
 import { jsPDF } from "jspdf";
+import { detectTargetMode, splitTarget, extractTargetCartonCount } from "./utils/targetPacking.js";
 
 const SIZE_ORDER = ["S","M","L","XL","2X","3X","4X","5X"];
 const BOXES = ["A","B","C","D"];
@@ -24,7 +25,8 @@ const COL = {
   pickTicket:"PICK TICKET #", itemId:"ITEM ID", bodyDesc:"BODY DESCRIPTION",
   color:"COLOR NAME",
   custPO:"CUST. PO NUMBER", workOrder:"WORK ORDER #",
-  size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY"
+  size:"SIZE", sizeQty:"SIZE NET ORDER QTY", specInst1:"SPEC INST DESCRIPTION 1", lineQtyMaybe:"NET ORDER QTY",
+  billToName:"BILL TO NAME"
 };
 
 function normString(s){ return (s??"").toString().normalize("NFKC").replace(/\u2019/g,"'").trim(); }
@@ -151,7 +153,9 @@ function zplForLabel(meta, box){
   z+=sizeLine("2X", box.sizes["2X"]); z+=sizeLine("3X", box.sizes["3X"]); z+=sizeLine("4X", box.sizes["4X"]); z+=sizeLine("5X", box.sizes["5X"]);
   y+=6; z+=L(`Total: ${box.total}`, true); y+=6;
   z+=`^FO${left},${y}^A0N,24,18^FDBOX ${box.boxIndex} OF ${box.boxCount}^FS\n`; y+=28;
-  const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "";
+  const dim = box.boxType === "TARGET" 
+    ? " (Target 7-unit scale)" 
+    : (BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "");
   z+=`^FO${left},${y}^A0N,24,18^FDBox Size: ${box.boxType}${dim}^FS\n`; y+=28;
   // Removed "Line X" per user request
   z+=`^FO${left},${LL-180}^BY2,2,120^BCN,120,Y,N,N^FD${escapeZPL(meta.pick)}^FS\n`;
@@ -168,7 +172,10 @@ function renderPDF(labels){
     y+=4; const sizeLine=(lab,val)=>{ const lh=14; doc.setFontSize(12); doc.setFont("helvetica","bold"); doc.text(`${lab}:`,x0,y); doc.setFont("helvetica","normal"); doc.text(val?String(val):"", x0+40, y); y+=lh; };
     ["S","M","L","XL","2X","3X","4X","5X"].forEach(sk=>sizeLine(sk, box.sizes[sk]||0));
     y+=4; line(`Total: ${box.total}`,12,true); y+=6; doc.setFontSize(11); doc.setFont("helvetica","bold"); doc.text(`BOX ${box.boxIndex} OF ${box.boxCount}`,x0,y); y+=16;
-    const dim = BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : ""; doc.setFont("helvetica","normal"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
+    const dim = box.boxType === "TARGET"
+      ? " (Target 7-unit scale)"
+      : (BOX_DIMENSIONS[box.boxType] ? ` ${BOX_DIMENSIONS[box.boxType]}` : "");
+    doc.setFont("helvetica","normal"); doc.text(`Box Size: ${box.boxType}${dim}`,x0,y); y+=16;
     // Removed "Line X"
     const bc=canvasFromBarcode(meta.pick); const bcW=240, bcH=50; doc.addImage(bc.toDataURL("image/png"),"PNG", x0, 576-bcH-24, bcW, bcH);
   };
@@ -207,6 +214,7 @@ export default function App(){
     rows.forEach((r, idx)=>{
       const pick=grab(r,COL.pickTicket), item=grab(r,COL.itemId), wo=grab(r,COL.workOrder);
       const body=grab(r,COL.bodyDesc), color=grab(r,COL.color), po=normPO(r?.[COL.custPO]), spec1=grab(r,COL.specInst1);
+      const billToName=grab(r,COL.billToName);
       const rawSize=grab(r,COL.size); const size=normalizeSizeToken(rawSize);
       const qty=Number(grab(r,COL.sizeQty)||0);
       const lineQtyMaybe = Number(grab(r,COL.lineQtyMaybe) || 0) || null;
@@ -215,7 +223,7 @@ export default function App(){
       const mode=detectMode(spec1), sleeve=detectSleeve(body);
       if(!pick||!item||!wo){ errs.push(`Row ${idx+1}: missing key fields (Pick/Item/WO)`); return; }
 
-      const gk={pick,item,wo,body,color,po,mode,sleeve};
+      const gk={pick,item,wo,body,color,po,mode,sleeve,billToName,spec1};
       const key=JSON.stringify(gk);
       if(!groups.has(key)) groups.set(key,{key:gk, sizes:normalizeSizes({}), _rawIgnored:[], expected: lineQtyMaybe, lineSeqs:[lineSeq]});
       const g=groups.get(key);
@@ -228,25 +236,48 @@ export default function App(){
 
     groups.forEach((g)=>{
       const {key:baseMeta, sizes, _rawIgnored, expected, lineSeqs} = g;
-      const {mode, sleeve, ...metaFields} = baseMeta;
+      const {mode, sleeve, billToName, spec1, ...metaFields} = baseMeta;
       const actual = sumSizes(sizes);
       if(expected){ if(actual!==expected){ blocking=true; errs.push(`Pick ${metaFields.pick} / Item ${metaFields.item} / WO ${metaFields.wo}: sizes sum ${actual} ≠ line qty ${expected}. Ignored: [${_rawIgnored.join(", ")}]`);} }
 
-      const table = mode==="POLYBAG"?PB:PF;
-      const capsSXL = table[sleeve].SXL;
-      const capsBIG = table[sleeve].BIG;
-      const totals  = table[sleeve].SXL;
+      // Check for Target mode first
+      const isTarget = detectTargetMode(spec1, billToName, metaFields.po);
+      let boxes;
 
-      const {boxes} = (mode==="POLYBAG")
-        ? splitPolybagBySize(sizes, capsSXL, capsBIG, totals)
-        : splitPF(sizes, capsSXL, capsBIG, totals);
+      if (isTarget) {
+        // Target mode: fixed scale packing
+        const numberOfCartons = extractTargetCartonCount(sizes);
+        if (!numberOfCartons) {
+          blocking = true;
+          errs.push(`Pick ${metaFields.pick} / Item ${metaFields.item} / WO ${metaFields.wo}: Target order total (${actual}) is not divisible by 7.`);
+          boxes = [];
+        } else {
+          try {
+            const result = splitTarget(sizes, numberOfCartons);
+            boxes = result.boxes;
+          } catch (error) {
+            blocking = true;
+            errs.push(`Pick ${metaFields.pick} / Item ${metaFields.item} / WO ${metaFields.wo}: ${error.message}`);
+            boxes = [];
+          }
+        }
+      } else {
+        // Existing logic for PF/PB modes (unchanged)
+        const table = mode==="POLYBAG"?PB:PF;
+        const capsSXL = table[sleeve].SXL;
+        const capsBIG = table[sleeve].BIG;
+        const totals  = table[sleeve].SXL;
+        boxes = (mode==="POLYBAG")
+          ? splitPolybagBySize(sizes, capsSXL, capsBIG, totals).boxes
+          : splitPF(sizes, capsSXL, capsBIG, totals).boxes;
+      }
 
       const lineSeq = Math.min(...lineSeqs.filter(Boolean));
 
       boxes.forEach((b,i)=>{
         const total = sumSizes(b.sizes);
         const meta = {...metaFields, lineSeq};
-        out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode, sizes:normalizeSizes(b.sizes), total } });
+        out.push({ meta, box:{ boxIndex:i+1, boxCount:boxes.length, boxType:b.boxType, sleeve, mode: isTarget ? "TARGET" : mode, sizes:normalizeSizes(b.sizes), total } });
       });
     });
 
@@ -281,7 +312,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>Carton Label Builder (4×8 – Zebra 203dpi)</h1>
-      <p><span className="pill">Modes</span>: <b>Printers & Fold</b> (mix sizes) • <b>Polybag</b> (no mixing, per-size cartons). D-first for fulls, then smallest that fits; never overflow.</p>
+      <p><span className="pill">Modes</span>: <b>Printers & Fold</b> (mix sizes) • <b>Polybag</b> (no mixing, per-size cartons) • <b>Target</b> (7 units per case, 1-1-2-2-1 scale). D-first for fulls, then smallest that fits; never overflow.</p>
 
       <div className="card" onDrop={handleDrop} onDragOver={e=>e.preventDefault()}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
@@ -312,7 +343,7 @@ export default function App(){
           <div className="grid">
             {preview.map((l,i)=>(
               <div key={i} className="card">
-                <div style={{fontSize:12, color:'#6b7280', marginBottom:8}}>{l.box.boxIndex} / {l.box.boxCount} • Box {l.box.boxType} • {l.box.mode==="POLYBAG"?"No-mix":"Mix OK"}</div>
+                <div style={{fontSize:12, color:'#6b7280', marginBottom:8}}>{l.box.boxIndex} / {l.box.boxCount} • Box {l.box.boxType} • {l.box.mode==="POLYBAG"?"No-mix":l.box.mode==="TARGET"?"Target 7-unit":"Mix OK"}</div>
                 <div><b>Pick Ticket:</b> {l.meta.pick}</div>
                 <div><b>Item ID:</b> {l.meta.item}</div>
                 <div><b>Body:</b> {l.meta.body}</div>
@@ -326,7 +357,7 @@ export default function App(){
                 </div>
                 <div style={{marginTop:8}}><b>Total:</b> {l.box.total}</div>
                 <div>BOX {l.box.boxIndex} OF {l.box.boxCount}</div>
-                <div>Box Size: {l.box.boxType} {BOX_DIMENSIONS[l.box.boxType]||""}</div>
+                <div>Box Size: {l.box.boxType} {l.box.boxType === "TARGET" ? "(Target 7-unit scale)" : (BOX_DIMENSIONS[l.box.boxType]||"")}</div>
                 <Barcode value={l.meta.pick} />
               </div>
             ))}
