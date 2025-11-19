@@ -3,7 +3,13 @@ import { TARGET_CONFIG, getExpectedTotalForSize, getExpectedTotalUnits } from '.
 export function detectTargetMode(specInst, customerName, custPO) {
   if (!specInst && !customerName && !custPO) return false;
   const text = [specInst, customerName, custPO].filter(Boolean).join(' ').toUpperCase();
-  return text.includes('TARGET') || text.includes('PCSI') || text.includes('UNITS PER CASE = 7');
+  return (
+    text.includes('TARGET') ||
+    text.includes('PCSI') ||
+    text.includes('PACK PER CASEPACK') ||
+    text.includes('CASEPACK AND SIZE SCALE') ||
+    text.includes('UNITS PER CASE = 7')
+  );
 }
 export function validateTargetPacking(totalBySize, numberOfCartons) {
   if (numberOfCartons <= 0) return { valid: false, error: 'Number of cartons must be greater than 0' };
